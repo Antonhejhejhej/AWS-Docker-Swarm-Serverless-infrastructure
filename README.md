@@ -3,6 +3,7 @@ A demo of AWS infrastructure for hosting a Docker swarm as well as a serverless 
 
 # Folder structure
 
+<pre>
 Root/
 ├─ serverless/
 │  ├─ client.js
@@ -18,4 +19,4 @@ Root/
 │  ├─ iac/
 │  │  ├─ deploy.sh
 │  │  ├─ swarm-stack.yaml
-
+<pre>
