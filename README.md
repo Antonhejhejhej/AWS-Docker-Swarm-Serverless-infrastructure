@@ -12,11 +12,11 @@ Root/
 │  ├─ index.js
 │  ├─ serverless.yaml
 ├─ swarm/
-│  ├─ application/
+│  ├─ Application/
 │  │  ├─ AntonApp/
 │  │  │  ├─ dockerfile
 │  │  │  ├─ (and dotnet application files)
-│  ├─ iac/
+│  ├─ IAC/
 │  │  ├─ deploy.sh
 │  │  ├─ swarm-stack.yaml
 <pre>
