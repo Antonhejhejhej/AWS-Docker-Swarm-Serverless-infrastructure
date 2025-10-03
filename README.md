@@ -14,7 +14,7 @@ Root/
 ├─ swarm/
 │  ├─ Application/
 │  │  ├─ AntonApp/
-│  │  │  ├─ dockerfile
+│  │  │  ├─ Dockerfile
 │  │  │  ├─ (and dotnet application files)
 │  ├─ IAC/
 │  │  ├─ deploy.sh
