@@ -1,0 +1,219 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Basic Serverless Demo (S3 Static Hosting, DynamoDB, Lambda, API Gateway, CloudFront)
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: Name for the S3 bucket (must be globally unique)
+  DynamoTableName:
+    Type: String
+    Default: SimpleTable
+    Description: DynamoDB table name
+
+Resources:
+
+  StaticSiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      WebsiteConfiguration:
+        IndexDocument: index.html
+
+  StaticSiteOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${BucketName}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+        Description: Origin Access Control for S3 static site
+
+  StaticSiteCloudFront:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt StaticSiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt StaticSiteOAC.Id
+            S3OriginConfig: {}
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  StaticSiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref StaticSiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipalRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${StaticSiteBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                "AWS:SourceArn": !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${StaticSiteCloudFront}"
+
+  DemoTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref DynamoTableName
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  ServerlessDemoLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: dynamodb-read
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Scan
+                Resource: !GetAtt DemoTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  ServerlessDemoLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ServerlessDemoLambda
+      Handler: index.handler
+      Role: !GetAtt ServerlessDemoLambdaRole.Arn
+      Runtime: nodejs18.x
+      Timeout: 10
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          const { DynamoDBClient, GetItemCommand } = require("@aws-sdk/client-dynamodb");
+          const client = new DynamoDBClient({});
+          exports.handler = async (event) => {
+            const params = {
+              TableName: process.env.TABLE_NAME,
+              Key: { id: { S: "demo" } }
+            };
+            try {
+              const data = await client.send(new GetItemCommand(params));
+              let value = data.Item && data.Item.value ? data.Item.value.S : "No value found";
+              return {
+                statusCode: 200,
+                headers: {
+                  "Access-Control-Allow-Origin": "*"
+                },
+                body: JSON.stringify({ value })
+              };
+            } catch (err) {
+              return {
+                statusCode: 500,
+                headers: {
+                  "Access-Control-Allow-Origin": "*"
+                },
+                body: JSON.stringify({ error: err.message })
+              };
+            }
+          };
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref DynamoTableName
+
+  ServerlessDemoApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: ServerlessDemoApi
+
+  ServerlessDemoApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ServerlessDemoApi
+      ParentId: !GetAtt ServerlessDemoApi.RootResourceId
+      PathPart: items
+
+  ServerlessDemoApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ServerlessDemoApi
+      ResourceId: !Ref ServerlessDemoApiResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub
+          - arn:aws:apigateway:${Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - { Region: !Ref "AWS::Region", LambdaArn: !GetAtt ServerlessDemoLambda.Arn }
+      MethodResponses:
+        - StatusCode: 200
+
+  ServerlessDemoApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ServerlessDemoApiMethod
+    Properties:
+      RestApiId: !Ref ServerlessDemoApi
+      StageName: prod
+
+  ServerlessDemoLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ServerlessDemoLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ServerlessDemoApi}/*"
+
+Outputs:
+  WebsiteURL:
+    Description: S3 Static Website URL
+    Value: !GetAtt StaticSiteBucket.WebsiteURL
+  CloudFrontURL:
+    Description: CloudFront Distribution URL
+    Value: !Sub "https://${StaticSiteCloudFront.DomainName}"
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${ServerlessDemoApi}.execute-api.${AWS::Region}.amazonaws.com/prod/items"
+  TableName:
+    Description: DynamoDB Table Name
+    Value: !Ref DemoTable
