@@ -1,0 +1,586 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Docker Swarm - Fixed Manager + Scalable Workers (With ECR Support - Enhanced Auto ECR Auth)
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetA:
+    Type: AWS::EC2::Subnet::Id
+  SubnetB:
+    Type: AWS::EC2::Subnet::Id
+  SubnetC:
+    Type: AWS::EC2::Subnet::Id
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+  InstanceType:
+    Type: String
+    Default: t3.small
+  DesiredCapacity:
+    Type: Number
+    Default: 2
+    Description: Number of worker nodes
+  MaxSize:
+    Type: Number
+    Default: 6
+  LaunchDemoService:
+    Type: String
+    Default: true
+    AllowedValues: [true, false]
+  SSHIngressCidr:
+    Type: String
+    Default: 0.0.0.0/0
+
+Conditions:
+  LaunchDemoServiceCondition: !Equals [!Ref LaunchDemoService, "true"]
+
+Resources:
+
+  AppECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${AWS::StackName}-dotnet-app"
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 7
+                },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 2,
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-app-repo"
+
+  # Security Groups
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB Security Group
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-alb-sg"
+
+  SwarmSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Swarm Nodes Security Group
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHIngressCidr
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-swarm-sg"
+
+  # Separate security group rules to avoid circular dependency
+  SwarmIngressManagerPort:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SwarmSecurityGroup
+      IpProtocol: tcp
+      FromPort: 2377
+      ToPort: 2377
+      SourceSecurityGroupId: !Ref SwarmSecurityGroup
+
+  SwarmIngressGossipTCP:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SwarmSecurityGroup
+      IpProtocol: tcp
+      FromPort: 7946
+      ToPort: 7946
+      SourceSecurityGroupId: !Ref SwarmSecurityGroup
+
+  SwarmIngressGossipUDP:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SwarmSecurityGroup
+      IpProtocol: udp
+      FromPort: 7946
+      ToPort: 7946
+      SourceSecurityGroupId: !Ref SwarmSecurityGroup
+
+  SwarmIngressOverlay:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SwarmSecurityGroup
+      IpProtocol: udp
+      FromPort: 4789
+      ToPort: 4789
+      SourceSecurityGroupId: !Ref SwarmSecurityGroup
+
+  # IAM Role with Enhanced ECR Support
+  SwarmInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: SwarmParameterAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:GetParameter
+                Resource: 
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/swarm/*"
+              # Enhanced ECR Permissions for all operations
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:DescribeImages
+                  - ecr:DescribeRepositories
+                  - ecr:ListImages
+                Resource: "*"
+              # ECR push permissions
+              - Effect: Allow
+                Action:
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                Resource: 
+                  - !GetAtt AppECRRepository.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-swarm-role"
+
+  SwarmInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref SwarmInstanceRole]
+
+  # Target Groups with manager pre-registered
+  WebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-web-tg"
+      VpcId: !Ref VpcId
+      Port: 80
+      Protocol: HTTP
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Targets:
+        - Id: !Ref SwarmManager
+          Port: 80
+
+  VisualizerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: LaunchDemoServiceCondition
+    Properties:
+      Name: !Sub "${AWS::StackName}-viz-tg"
+      VpcId: !Ref VpcId
+      Port: 8080
+      Protocol: HTTP
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Targets:
+        - Id: !Ref SwarmManager
+          Port: 8080
+
+  # Load Balancer
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${AWS::StackName}-alb"
+      Scheme: internet-facing
+      Subnets: [!Ref SubnetA, !Ref SubnetB, !Ref SubnetC]
+      SecurityGroups: [!Ref ALBSecurityGroup]
+
+  WebListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebTargetGroup
+
+  VisualizerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: LaunchDemoServiceCondition
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 8080
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref VisualizerTargetGroup
+
+  # MANAGER NODE
+  SwarmManager:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64}}'
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      IamInstanceProfile: !Ref SwarmInstanceProfile
+      SecurityGroupIds: [!Ref SwarmSecurityGroup]
+      SubnetId: !Ref SubnetA
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-manager"
+        - Key: Role
+          Value: manager
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          exec > /var/log/swarm-manager.log 2>&1
+          
+          echo "=== Manager Bootstrap Start $(date) ==="
+          
+          # Install Docker
+          dnf update -y
+          dnf install -y docker
+          systemctl enable --now docker
+          usermod -aG docker ec2-user
+          
+          # Wait for Docker to be ready
+          until systemctl is-active --quiet docker; do sleep 2; done
+          
+          # ENHANCED ECR Authentication Setup
+          echo "=== Setting up ECR authentication ==="
+          
+          # Install ECR credential helper FIRST
+          curl -Lo /usr/local/bin/docker-credential-ecr-login https://amazon-ecr-credential-helper-releases.s3.us-east-2.amazonaws.com/0.7.1/linux-amd64/docker-credential-ecr-login
+          chmod +x /usr/local/bin/docker-credential-ecr-login
+          
+          # Configure credential helper for root
+          mkdir -p /root/.docker
+          cat > /root/.docker/config.json << EOF
+          {
+            "credHelpers": {
+              "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com": "ecr-login"
+            }
+          }
+          EOF
+          
+          # Configure credential helper for ec2-user
+          mkdir -p /home/ec2-user/.docker
+          cat > /home/ec2-user/.docker/config.json << EOF
+          {
+            "credHelpers": {
+              "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com": "ecr-login"
+            }
+          }
+          EOF
+          chown -R ec2-user:ec2-user /home/ec2-user/.docker
+          
+          # Initial ECR login
+          aws ecr get-login-password --region ${AWS::Region} | docker login --username AWS --password-stdin ${AppECRRepository.RepositoryUri}
+          
+          # Create a service to refresh ECR token every 10 hours
+          cat > /etc/systemd/system/ecr-refresh.service << EOF
+          [Unit]
+          Description=ECR Token Refresh
+          After=docker.service
+          
+          [Service]
+          Type=oneshot
+          ExecStart=/bin/bash -c 'aws ecr get-login-password --region ${AWS::Region} | docker login --username AWS --password-stdin ${AppECRRepository.RepositoryUri}'
+          User=root
+          EOF
+          
+          cat > /etc/systemd/system/ecr-refresh.timer << EOF
+          [Unit]
+          Description=ECR Token Refresh Timer
+          
+          [Timer]
+          OnBootSec=1h
+          OnUnitActiveSec=10h
+          
+          [Install]
+          WantedBy=timers.target
+          EOF
+          
+          systemctl enable ecr-refresh.timer
+          systemctl start ecr-refresh.timer
+          
+          # Get Manager IP
+          MANAGER_IP=$(hostname -I | awk '{print $1}')
+          echo "Manager IP: $MANAGER_IP"
+          
+          # Initialize Swarm
+          docker swarm init --advertise-addr "$MANAGER_IP"
+          
+          # Get tokens
+          WORKER_TOKEN=$(docker swarm join-token -q worker)
+          MANAGER_TOKEN=$(docker swarm join-token -q manager)
+          
+          # Store in SSM for workers to use
+          aws ssm put-parameter --region ${AWS::Region} --name "/swarm/manager-ip" --value "$MANAGER_IP" --type String --overwrite
+          aws ssm put-parameter --region ${AWS::Region} --name "/swarm/worker-token" --value "$WORKER_TOKEN" --type SecureString --overwrite
+          aws ssm put-parameter --region ${AWS::Region} --name "/swarm/manager-token" --value "$MANAGER_TOKEN" --type SecureString --overwrite
+          
+          # Store ECR info for easy access
+          aws ssm put-parameter --region ${AWS::Region} --name "/swarm/ecr-repository" --value "${AppECRRepository.RepositoryUri}" --type String --overwrite
+          
+          # Create ECR login helper script for manual use
+          cat > /home/ec2-user/ecr-login.sh << 'EOF'
+          #!/bin/bash
+          aws ecr get-login-password --region ${AWS::Region} | docker login --username AWS --password-stdin ${AppECRRepository.RepositoryUri}
+          EOF
+          chmod +x /home/ec2-user/ecr-login.sh
+          chown ec2-user:ec2-user /home/ec2-user/ecr-login.sh
+          
+          # Deploy demo services if requested
+          if [[ "${LaunchDemoService}" == "true" ]]; then
+            echo "Deploying demo services..."
+            sleep 10  # Let swarm stabilize
+            
+            # Deploy nginx
+            docker service create \
+              --name web \
+              --publish 80:80 \
+              --replicas $((${DesiredCapacity} + 1)) \
+              nginx:alpine
+            
+            # Deploy visualizer
+            docker service create \
+              --name viz \
+              --publish 8080:8080 \
+              --constraint node.role==manager \
+              --mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock \
+              dockersamples/visualizer:stable
+          fi
+          
+          echo "=== Manager Bootstrap Complete $(date) ==="
+
+  # WORKER NODES (Auto Scaling Group)
+  WorkerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    DependsOn: SwarmManager  # Ensure manager starts first
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64}}'
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        IamInstanceProfile:
+          Arn: !GetAtt SwarmInstanceProfile.Arn
+        SecurityGroupIds: [!Ref SwarmSecurityGroup]
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "${AWS::StackName}-worker"
+              - Key: Role
+                Value: worker
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euo pipefail
+            exec > /var/log/swarm-worker.log 2>&1
+            
+            echo "=== Worker Bootstrap Start $(date) ==="
+            
+            # Install Docker
+            dnf update -y
+            dnf install -y docker
+            systemctl enable --now docker
+            usermod -aG docker ec2-user
+            
+            # Wait for Docker
+            until systemctl is-active --quiet docker; do sleep 2; done
+            
+            # PRODUCTION-READY ECR Authentication Setup
+            echo "=== Setting up ECR authentication for worker ==="
+            
+            # Install ECR credential helper FIRST
+            curl -Lo /usr/local/bin/docker-credential-ecr-login https://amazon-ecr-credential-helper-releases.s3.us-east-2.amazonaws.com/0.7.1/linux-amd64/docker-credential-ecr-login
+            chmod +x /usr/local/bin/docker-credential-ecr-login
+            
+            # Configure credential helper for root
+            mkdir -p /root/.docker
+            cat > /root/.docker/config.json << EOF
+            {
+              "credHelpers": {
+                "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com": "ecr-login"
+              }
+            }
+            EOF
+            
+            # Configure credential helper for ec2-user
+            mkdir -p /home/ec2-user/.docker
+            cat > /home/ec2-user/.docker/config.json << EOF
+            {
+              "credHelpers": {
+                "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com": "ecr-login"
+              }
+            }
+            EOF
+            chown -R ec2-user:ec2-user /home/ec2-user/.docker
+            
+            # Initial ECR login
+            aws ecr get-login-password --region ${AWS::Region} | docker login --username AWS --password-stdin ${AppECRRepository.RepositoryUri}
+            
+            # Create a service to refresh ECR token every 10 hours
+            cat > /etc/systemd/system/ecr-refresh.service << EOF
+            [Unit]
+            Description=ECR Token Refresh
+            After=docker.service
+            
+            [Service]
+            Type=oneshot
+            ExecStart=/bin/bash -c 'aws ecr get-login-password --region ${AWS::Region} | docker login --username AWS --password-stdin ${AppECRRepository.RepositoryUri}'
+            User=root
+            EOF
+            
+            cat > /etc/systemd/system/ecr-refresh.timer << EOF
+            [Unit]
+            Description=ECR Token Refresh Timer
+            
+            [Timer]
+            OnBootSec=1h
+            OnUnitActiveSec=10h
+            
+            [Install]
+            WantedBy=timers.target
+            EOF
+            
+            systemctl enable ecr-refresh.timer
+            systemctl start ecr-refresh.timer
+            
+            # Create ECR login helper script for manual use
+            cat > /home/ec2-user/ecr-login.sh << 'EOF'
+            #!/bin/bash
+            aws ecr get-login-password --region ${AWS::Region} | docker login --username AWS --password-stdin ${AppECRRepository.RepositoryUri}
+            EOF
+            chmod +x /home/ec2-user/ecr-login.sh
+            chown ec2-user:ec2-user /home/ec2-user/ecr-login.sh
+            
+            # Wait for manager to be ready and get swarm info
+            for i in {1..30}; do
+              MANAGER_IP=$(aws ssm get-parameter --region ${AWS::Region} --name "/swarm/manager-ip" --query Parameter.Value --output text 2>/dev/null || echo "")
+              WORKER_TOKEN=$(aws ssm get-parameter --region ${AWS::Region} --with-decryption --name "/swarm/worker-token" --query Parameter.Value --output text 2>/dev/null || echo "")
+              
+              if [[ -n "$MANAGER_IP" && -n "$WORKER_TOKEN" && "$MANAGER_IP" != "None" && "$WORKER_TOKEN" != "None" ]]; then
+                echo "Found manager: $MANAGER_IP"
+                break
+              fi
+              
+              echo "Waiting for manager... ($i/30)"
+              sleep 10
+            done
+            
+            if [[ -z "$MANAGER_IP" || -z "$WORKER_TOKEN" ]]; then
+              echo "FATAL: Could not get manager info"
+              exit 1
+            fi
+            
+            # Join swarm as worker
+            echo "Joining swarm: $MANAGER_IP:2377"
+            for attempt in {1..5}; do
+              if docker swarm join --token "$WORKER_TOKEN" "$MANAGER_IP:2377"; then
+                echo "Successfully joined swarm"
+                break
+              fi
+              echo "Join attempt $attempt failed, retrying..."
+              sleep 5
+            done
+            
+            echo "=== Worker Bootstrap Complete $(date) ==="
+
+  # Auto Scaling Group (Workers Only)
+  WorkerAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: [!Ref SubnetA, !Ref SubnetB, !Ref SubnetC]
+      MinSize: 1
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref DesiredCapacity
+      TargetGroupARNs: 
+        - !Ref WebTargetGroup
+        - !If [LaunchDemoServiceCondition, !Ref VisualizerTargetGroup, !Ref "AWS::NoValue"]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WorkerLaunchTemplate
+        Version: !GetAtt WorkerLaunchTemplate.LatestVersionNumber
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-worker"
+          PropagateAtLaunch: true
+
+Outputs:
+  LoadBalancerDNSName:
+    Description: ALB DNS Name
+    Value: !GetAtt LoadBalancer.DNSName
+  NginxServiceURL:
+    Description: Web Service URL
+    Value: !Sub "http://${LoadBalancer.DNSName}"
+  VisualizerURL:
+    Description: Visualizer URL  
+    Value: !Sub "http://${LoadBalancer.DNSName}:8080"
+    Condition: LaunchDemoServiceCondition
+  ManagerInstanceId:
+    Description: Manager Instance ID
+    Value: !Ref SwarmManager
+  AutoScalingGroupName:
+    Description: Worker ASG Name
+    Value: !Ref WorkerAutoScalingGroup
+  ECRRepositoryURI:
+    Description: ECR Repository URI for your .NET app
+    Value: !GetAtt AppECRRepository.RepositoryUri
+  ECRLoginCommand:
+    Description: Command to login to ECR
+    Value: !Sub "aws ecr get-login-password --region ${AWS::Region} | docker login --username AWS --password-stdin ${AppECRRepository.RepositoryUri}"
+  DeployDotNetCommand:
+    Description: Example command to deploy .NET app from ECR
+    Value: !Sub "sudo docker service create --name dotnet-app --publish 80:80 --replicas 3 ${AppECRRepository.RepositoryUri}:latest"
+  ScalingCommands:
+    Description: Commands to scale the cluster
+    Value: !Sub "aws autoscaling set-desired-capacity --auto-scaling-group-name ${WorkerAutoScalingGroup} --desired-capacity <number>"
